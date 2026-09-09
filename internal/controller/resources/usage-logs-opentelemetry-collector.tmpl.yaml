@@ -47,8 +47,7 @@ spec:
             from_attribute: log_name
           - action: upsert
             key: kubernetes_namespace_name
-            # from_attribute: service.namespace
-            value: {{.GatewayNamespace}}
+            from_attribute: service.namespace
 
       # separate resource logs blocks so no overrides of the shared block upstream host value for k8s attributes correct information
       groupbyattrs/upstream_host:
