@@ -42,10 +42,10 @@ spec:
       # (possbily a mistake to allow service.namespace becuase of k8s services naming and otel spec but this is what maas has right now along service.name as well)
       resource:
         attributes:
-          - action: upsert
+          - action: insert
             key: log_type
             from_attribute: log_name
-          - action: upsert
+          - action: insert
             key: kubernetes_namespace_name
             from_attribute: service.namespace
 
