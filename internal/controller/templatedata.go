@@ -205,7 +205,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	// Usage logs collector configuration (independent of Loki storage resolution)
-	templateData["UsageLogsCollectorName"] = "usage-logs"
+	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
 		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, monitoringNamespace)
 		templateData["UsageLogs"] = true
