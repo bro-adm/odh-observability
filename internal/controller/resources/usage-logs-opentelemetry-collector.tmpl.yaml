@@ -5,6 +5,8 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     app.kubernetes.io/part-of: data-science-observability
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{.UsageLogsCollectorName}}-tls
 spec:
   mode: deployment
   replicas: {{.CollectorReplicas}}  
@@ -15,19 +17,38 @@ spec:
     requests:
       cpu: {{.CollectorCPURequest}}
       memory: {{.CollectorMemoryRequest}}
+  volumes:
+    - name: tls-certs
+      secret:
+        secretName: {{.UsageLogsCollectorName}}-tls
+  volumeMounts:
+    - name: tls-certs
+      mountPath: /etc/otel/certs
+      readOnly: true
 
   config:
     extensions:
-      bearertokenauth:
-        filename: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # forward the caller's Authorization header (on-behalf-of) to the exporter instead of
+      # authenticating to loki with the collector's own service account token.
+      # requires include_metadata on the receivers so the incoming header reaches the client context.
+      headers_setter:
+        headers:
+          - action: upsert
+            key: Authorization
+            from_context: authorization
 
     receivers:
       otlp:
         protocols:
           grpc:
             endpoint: '0.0.0.0:4317'
+            include_metadata: true
+            tls:
+              cert_file: /etc/otel/certs/tls.crt
+              key_file: /etc/otel/certs/tls.key
           http:
             endpoint: '0.0.0.0:4318'
+            include_metadata: true
 
     processors:
       # 1. Protect pod against OOM kills under heavy log spikes
@@ -159,7 +180,12 @@ spec:
               - delete_key(resource.attributes, "node_name")
 
       # 7. Batch logs for optimal export performance
-      batch: {}
+      # metadata_keys keeps a separate batcher per caller token so the Authorization header
+      # survives batching and is never mixed between tenants (empty metadata_keys drops it).
+      batch:
+        metadata_keys:
+          - authorization
+        metadata_cardinality_limit: 1000
 
     exporters:
 {{- if .UsageLogs}}
@@ -168,13 +194,13 @@ spec:
         tls:
           ca_file: "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"
         auth:
-          authenticator: bearertokenauth
+          authenticator: headers_setter
         headers:
           "X-Scope-OrgID": "application"
 {{- end}}
 
     service:
-      extensions: [bearertokenauth]
+      extensions: [headers_setter]
       telemetry:
         metrics:
           readers:

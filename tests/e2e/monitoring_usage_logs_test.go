@@ -171,17 +171,32 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.endpoint == "0.0.0.0:4317"`),
 			jq.Match(`.spec.config.receivers.otlp.protocols.http.endpoint == "0.0.0.0:4318"`),
 
+			// Verify the incoming Authorization header is captured into the client context
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.include_metadata == true`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.include_metadata == true`),
+
+			// Verify the caller's bearer token is forwarded on export instead of the collector SA token
+			jq.Match(`.spec.config.extensions.bearertokenauth == null`),
+			jq.Match(`
+				(.spec.config.extensions.headers_setter.headers[0].key == "Authorization") and
+				(.spec.config.extensions.headers_setter.headers[0].from_context == "authorization")
+			`),
+			jq.Match(`.spec.config.service.extensions | contains(["headers_setter"])`),
+
 			// Verify processors
 			jq.Match(`.spec.config.processors.k8sattributes != null`),
 			jq.Match(`.spec.config.processors.k8sattributes.auth_type == "serviceAccount"`),
 			jq.Match(`.spec.config.processors."groupbyattrs/maas" != null`),
 			jq.Match(`.spec.config.processors.batch != null`),
 
+			// Batching must be keyed by token so the header survives and is not shared across callers
+			jq.Match(`.spec.config.processors.batch.metadata_keys | contains(["authorization"])`),
+
 			// Verify exporter endpoint (auto-generated from LokiStack)
 			jq.Match(`.spec.config.exporters."otlphttp/loki".endpoint | test("https://data-science-lokistack-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`),
 			jq.Match(`
 				(.spec.config.exporters."otlphttp/loki".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
-				(.spec.config.exporters."otlphttp/loki".auth.authenticator == "bearertokenauth")
+				(.spec.config.exporters."otlphttp/loki".auth.authenticator == "headers_setter")
 			`),
 			jq.Match(`.spec.config.exporters."otlphttp/loki".headers."X-Scope-OrgID" == "application"`),
 
