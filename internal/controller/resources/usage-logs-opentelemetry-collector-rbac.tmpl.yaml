@@ -20,6 +20,13 @@ rules:
       - get
       - watch
       - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{.UsageLogsCollectorName}}-writer
+rules:
+  # Required for k8sattributes processor
   - apiGroups: ["loki.grafana.com"]
     resources:
       - application
