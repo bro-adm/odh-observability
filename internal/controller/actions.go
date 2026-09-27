@@ -78,6 +78,7 @@ const (
 	AcceleratorRecordingRulesTemplate                = "resources/accelerator-recording-rules.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
+	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
@@ -545,6 +546,7 @@ func deployUsageLogsCollector(
 	*sources = append(*sources,
 		src(UsageLogsOpenTelemetryCollectorTemplate),
 		src(UsageLogsOpenTelemetryCollectorRBACTemplate),
+		src(UsageLogsOpenTelemetryCollectorNPTemplate),
 	)
 
 	return nil
