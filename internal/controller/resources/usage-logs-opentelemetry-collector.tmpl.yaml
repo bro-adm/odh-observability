@@ -15,6 +15,8 @@ spec:
     requests:
       cpu: {{.CollectorCPURequest}}
       memory: {{.CollectorMemoryRequest}}
+  networkPolicy:
+    enabled: false
 
   config:
     extensions:
