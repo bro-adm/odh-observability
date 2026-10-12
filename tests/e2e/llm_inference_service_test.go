@@ -819,29 +819,6 @@ func inferencePrerequisiteDir(projectRoot string) string {
 	return filepath.Join(projectRoot, "tests", "e2e", "prerequisites", "inference")
 }
 
-// warnIfStorageClassMissing reports a missing StorageClass up front. dsci.yaml pins
-// usageLogs to a named class, and PVCs that reference a missing one stay Pending
-// indefinitely, surfacing only as an unexplained LokiStack readiness timeout.
-func warnIfStorageClassMissing(t *testing.T, tc *TestContext, name string) {
-	t.Helper()
-
-	storageClasses := &unstructured.UnstructuredList{}
-	storageClasses.SetGroupVersionKind(schema.GroupVersionKind{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClassList"})
-	if err := tc.Client().List(tc.Context(), storageClasses); err != nil {
-		t.Logf("WARNING: failed to list StorageClasses to verify %q: %v", name, err)
-		return
-	}
-	available := make([]string, 0, len(storageClasses.Items))
-	for _, storageClass := range storageClasses.Items {
-		if storageClass.GetName() == name {
-			return
-		}
-		available = append(available, storageClass.GetName())
-	}
-	t.Logf("WARNING: dsci.yaml pins usageLogs storageClassName=%q but the cluster has only [%s]; "+
-		"LokiStack PVCs will stay Pending", name, strings.Join(available, ", "))
-}
-
 // logUsageLogsPropagation reports whether the DSCI kept spec.monitoring.usageLogs. It never
 // fails the run: DSCI -> Monitoring propagation is the opendatahub-operator's job, and
 // applyMonitoringManifest configures the Monitoring CR regardless.
@@ -962,7 +939,23 @@ func inferenceApplicationsNamespace() string {
 	return defaultInferenceApplicationsNamespace
 }
 
-// renderManifest reads a manifest and rewrites the default namespaces to the configured ones.
+// inferenceStorageClassName is the StorageClass the LokiStack PVCs bind to.
+// setupInferencePrerequisites sets it from the cluster's default class before any manifest is
+// applied; it is a package variable rather than a flag because the value is discovered, not
+// configured.
+var inferenceStorageClassName string
+
+// inferenceStorageClass resolves the class renderManifest substitutes into the manifests. Empty
+// means "use the manifest literal", which keeps rendering a no-op for the offline tests.
+func inferenceStorageClass() string {
+	if inferenceStorageClassName != "" {
+		return inferenceStorageClassName
+	}
+	return lokiStorageClassName
+}
+
+// renderManifest reads a manifest and rewrites the default namespaces and StorageClass to the
+// ones this run resolved.
 //
 // Substitution is textual because the namespace is not only a field: it is embedded in the
 // exporter endpoints (http://lgtm.<ns>.svc.cluster.local:4317) that dsci.yaml and monitoring.yaml
@@ -970,6 +963,10 @@ func inferenceApplicationsNamespace() string {
 // reverse -- which is why the manifests keep the RHOAI namespaces as their literals. Rewriting
 // toward them would have to match "opendatahub", a substring of every apiVersion in the
 // directory.
+//
+// The StorageClass rides the same mechanism for a different reason: dsci.yaml and monitoring.yaml
+// must declare it identically (TestMonitoringManifestMatchesDSCI), and every apply path funnels
+// through here, so one replacement keeps them in step.
 func renderManifest(path string) ([]byte, error) {
 	manifest, err := os.ReadFile(path)
 	if err != nil {
@@ -978,6 +975,7 @@ func renderManifest(path string) ([]byte, error) {
 	return []byte(strings.NewReplacer(
 		defaultInferenceMonitoringNamespace, inferenceMonitoringNamespace(),
 		defaultInferenceApplicationsNamespace, inferenceApplicationsNamespace(),
+		lokiStorageClassName, inferenceStorageClass(),
 	).Replace(string(manifest))), nil
 }
 
@@ -1151,12 +1149,17 @@ func applyMonitoringManifest(t *testing.T, tc *TestContext, dir string) {
 	)
 }
 
-// enableMaaSUsageLogging flips spec.usageLogging on the cluster-scoped MaaS Config CR.
+// setMaaSUsageLogging writes spec.usageLogging on the cluster-scoped MaaS Config CR.
 //
 // It writes the single field rather than replacing the spec: the maas-controller owns
 // spec.limitadorScrapeInterval and the maas.opendatahub.io/default-aitenant-bootstrapped
-// annotation on the same object, and there is no manifest here to declare them from.
-func enableMaaSUsageLogging(tc *TestContext) error {
+// annotation on the same object, and there is no manifest here to declare them from. That is also
+// why this is the one cluster-scoped change the suite rolls back -- nothing in the repo declares
+// it, so leaving it on would silently enable MaaS logging for whatever runs next.
+//
+// Passing remove deletes the field instead of writing false, for restoring a Config that never
+// carried it.
+func setMaaSUsageLogging(tc *TestContext, enabled, remove bool) error {
 	nn := types.NamespacedName{Name: maasConfigCRName}
 
 	var conflictErr error
@@ -1167,15 +1170,19 @@ func enableMaaSUsageLogging(tc *TestContext) error {
 			return fmt.Errorf("get MaaS Config %s: %w", nn, err)
 		}
 
-		// Re-runs against a configured cluster are the common case.
-		if enabled, _, err := unstructured.NestedBool(config.Object, "spec", "usageLogging"); err == nil && enabled {
+		// Already in the wanted state: the common case both for re-runs against a configured
+		// cluster and for a restore that has nothing to undo.
+		current, found, err := unstructured.NestedBool(config.Object, "spec", "usageLogging")
+		if err == nil && found == !remove && current == enabled {
 			return nil
 		}
-		if err := unstructured.SetNestedField(config.Object, true, "spec", "usageLogging"); err != nil {
+		if remove {
+			unstructured.RemoveNestedField(config.Object, "spec", "usageLogging")
+		} else if err := unstructured.SetNestedField(config.Object, enabled, "spec", "usageLogging"); err != nil {
 			return fmt.Errorf("set spec.usageLogging on MaaS Config %s: %w", nn, err)
 		}
 
-		err := tc.Client().Update(tc.Context(), config)
+		err = tc.Client().Update(tc.Context(), config)
 		switch {
 		case err == nil:
 			return nil
@@ -1186,6 +1193,93 @@ func enableMaaSUsageLogging(tc *TestContext) error {
 		}
 	}
 	return fmt.Errorf("update MaaS Config %s: %w", nn, conflictErr)
+}
+
+// registerUsageLogsFixtureCleanup removes the SeaweedFS fixtures and the Loki S3 Secret once the
+// whole suite has finished. Call it before startSeaweedFS, so an abort partway through setup
+// still tears down whatever got as far as existing.
+//
+// TestMonitoring registers the same teardown per group, because each of its groups owns a
+// separate fixture with its own bucket (monitoring_test.go:1345, monitoring_usage_logs_test.go:28).
+// Here the fixture is suite-scoped -- one bucket, needed from setup through the last topology --
+// so the teardown is too. The pre-clean in startSeaweedFS covers only the case where neither
+// runs, such as a killed binary. The Secret is not part of the fixture, so it is deleted here
+// alongside it.
+//
+// The LokiStack is deliberately left behind: it is the operand of a manifest-declared spec, and
+// the next run recreates this backend at the same Service DNS name.
+func registerUsageLogsFixtureCleanup(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	namespace := tc.MonitoringNamespace
+	t.Cleanup(func() {
+		if !testOpts.cleanupTestState {
+			// "not deleting" rather than "retained": this runs even when setup aborted before
+			// startSeaweedFS, in which case some of these were never created.
+			t.Logf("-cleanup-test-state=false; not deleting pods %s and %s, Service %s, or Secret %s in %s",
+				seaweedFSPodName, seaweedFSBucketPod, seaweedFSServiceName, lokiS3SecretName, namespace)
+			return
+		}
+		t.Logf("Removing the usage-logs S3 fixtures from %s", namespace)
+		tc.cleanupSeaweedFS()
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Secret, types.NamespacedName{Name: lokiS3SecretName, Namespace: namespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
+}
+
+// registerMaaSUsageLoggingRestore captures spec.usageLogging before the suite enables it and puts
+// it back afterwards.
+//
+// It is called from enableMaaSUsageLoggingPrerequisite, between the wait that proves
+// Config/default exists and the write that changes it. Both halves of that position matter.
+// Capturing earlier races the maas-controller's bootstrap of the CR: the Get would fail on a
+// fresh cluster, no cleanup would be registered, and the suite would then turn usage logging on
+// with nothing to turn it off -- the cross-run leak this function exists to prevent. Capturing
+// later would read back the suite's own value and restore nothing.
+//
+// t.Cleanup is LIFO and registerUsageLogsFixtureCleanup is registered much earlier, so MaaS
+// logging is still turned off before the S3 backend it writes through is removed.
+func registerMaaSUsageLoggingRestore(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	nn := types.NamespacedName{Name: maasConfigCRName}
+	config := &unstructured.Unstructured{}
+	config.SetGroupVersionKind(gvkMaaSConfig)
+	if err := tc.Client().Get(tc.Context(), nn, config); err != nil {
+		// The caller just waited for this CR, so this is not the bootstrap race. Continuing would
+		// mean enabling cluster-wide identity logging with no recorded value to restore.
+		t.Fatalf("failed to read MaaS Config %s to record spec.usageLogging: %v", maasConfigCRName, err)
+	}
+	original, hadValue, err := unstructured.NestedBool(config.Object, "spec", "usageLogging")
+	if err != nil {
+		t.Fatalf("failed to read spec.usageLogging from MaaS Config %s: %v", maasConfigCRName, err)
+	}
+
+	t.Cleanup(func() {
+		if !testOpts.cleanupTestState {
+			// Report the recorded prior value and the action being skipped, never the current
+			// one: this handler does no read-back, and it also runs when the suite died before
+			// the write, so any claim about what the field holds now can be false.
+			if hadValue {
+				t.Logf("-cleanup-test-state=false; not restoring spec.usageLogging=%t on MaaS Config %s",
+					original, maasConfigCRName)
+			} else {
+				t.Logf("-cleanup-test-state=false; not removing spec.usageLogging from MaaS Config %s, "+
+					"which did not carry the field before the run", maasConfigCRName)
+			}
+			return
+		}
+		if hadValue && original {
+			return
+		}
+		t.Logf("Restoring spec.usageLogging on MaaS Config %s", maasConfigCRName)
+		if err := setMaaSUsageLogging(tc, original, !hadValue); err != nil {
+			t.Errorf("failed to restore spec.usageLogging on MaaS Config %s: %v", maasConfigCRName, err)
+		}
+	})
 }
 
 // enableMaaSUsageLoggingPrerequisite turns on per-request usage logging in MaaS.
@@ -1206,8 +1300,12 @@ func enableMaaSUsageLoggingPrerequisite(t *testing.T, tc *TestContext) {
 		WithCustomErrorMsg("MaaS Config %s should be bootstrapped by the maas-controller", maasConfigCRName),
 	)
 
+	// Only now is the CR known to exist, so this is the earliest point its prior value can be
+	// recorded -- and it is still before the write below.
+	registerMaaSUsageLoggingRestore(t, tc)
+
 	t.Logf("Enabling spec.usageLogging on MaaS Config %s", maasConfigCRName)
-	if err := enableMaaSUsageLogging(tc); err != nil {
+	if err := setMaaSUsageLogging(tc, true, false); err != nil {
 		t.Fatalf("failed to enable MaaS usage logging: %v", err)
 	}
 
@@ -1330,8 +1428,12 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// The storage fixtures and the Loki S3 Secret must land where the operator creates the
 	// LokiStack, which dsci.yaml pins to spec.monitoring.namespace.
 	tc.MonitoringNamespace = inferenceMonitoringNamespace()
-	t.Logf("Inference prerequisites use applicationsNamespace=%s, monitoring.namespace=%s",
-		inferenceApplicationsNamespace(), inferenceMonitoringNamespace())
+	// Resolve the StorageClass before anything is applied: renderManifest substitutes it into
+	// dsci.yaml and monitoring.yaml, and a cluster with no default class has to fail here rather
+	// than 20 minutes later on a LokiStack whose PVCs were never going to bind.
+	inferenceStorageClassName = tc.ensureDefaultStorageClass(t)
+	t.Logf("Inference prerequisites use applicationsNamespace=%s, monitoring.namespace=%s, storageClassName=%s",
+		inferenceApplicationsNamespace(), inferenceMonitoringNamespace(), inferenceStorageClassName)
 	requireNamespacesMatchExistingDSCI(t, tc)
 
 	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string, timeout ...time.Duration) {
@@ -1387,6 +1489,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// is applied. The namespace does not exist yet; the ODH operator adopts it later.
 	t.Logf("Setting up the S3 backend for usage logs in %s", inferenceMonitoringNamespace())
 	tc.ensureNamespaceExists(inferenceMonitoringNamespace())
+	registerUsageLogsFixtureCleanup(t, tc)
 	tc.startSeaweedFS(t, lokiS3Bucket)
 	tc.createLokiS3Secret(t, lokiS3SecretName, inferenceMonitoringNamespace())
 
@@ -1398,7 +1501,6 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// usage logs is the difference between reading a run's log and guessing.
 	logUsageLogsPropagation(t, tc)
 
-	warnIfStorageClassMissing(t, tc, lokiStorageClassName)
 	requireObservabilityAgreesOnNamespaces(t, tc)
 
 	if testOpts.applyMonitoringManifest {

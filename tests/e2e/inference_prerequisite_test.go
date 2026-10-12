@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -162,14 +163,44 @@ func TestRenderManifestRewritesNamespaces(t *testing.T) {
 	require.NotContains(t, string(rendered), "redhat-ods-")
 }
 
+// TestRenderManifestRewritesStorageClass covers the substitution that makes the suite portable.
+// The manifests pin gp3-csi, which exists only on AWS; setupInferencePrerequisites replaces it
+// with whatever the cluster's default StorageClass is. Both manifests must be rewritten, because
+// dropping the field instead would not help -- the Monitoring CRD defaults it straight back to
+// gp3-csi (api/v1alpha1/monitoring_types.go).
+func TestRenderManifestRewritesStorageClass(t *testing.T) {
+	storageClass := inferenceStorageClassName
+	t.Cleanup(func() { inferenceStorageClassName = storageClass })
+	inferenceStorageClassName = "standard-csi"
+
+	for name, fieldPath := range map[string][]string{
+		"dsci.yaml":       {"spec", "monitoring", "usageLogs", "storage", "storageClassName"},
+		"monitoring.yaml": {"spec", "usageLogs", "storage", "storageClassName"},
+	} {
+		rendered, err := renderManifest(filepath.Join("prerequisites", "inference", name))
+		require.NoError(t, err)
+
+		manifest := map[string]any{}
+		require.NoError(t, utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(rendered), 4096).Decode(&manifest))
+		got, found, err := unstructured.NestedString(manifest, fieldPath...)
+		require.NoError(t, err)
+		require.True(t, found, "%s must declare %s", name, strings.Join(fieldPath, "."))
+		require.Equal(t, "standard-csi", got)
+		require.NotContains(t, string(rendered), lokiStorageClassName, "%s must not keep the placeholder class", name)
+	}
+}
+
 // TestRenderManifestDefaultsToManifestLiterals pins the no-op case: with both flags unset the
 // rendered bytes must equal the file, or the committed manifests stop being what actually runs.
 func TestRenderManifestDefaultsToManifestLiterals(t *testing.T) {
 	monitoringNamespace, applicationsNamespace := testOpts.monitoringNamespace, testOpts.applicationsNamespace
+	storageClass := inferenceStorageClassName
 	t.Cleanup(func() {
 		testOpts.monitoringNamespace, testOpts.applicationsNamespace = monitoringNamespace, applicationsNamespace
+		inferenceStorageClassName = storageClass
 	})
 	testOpts.monitoringNamespace, testOpts.applicationsNamespace = "", ""
+	inferenceStorageClassName = ""
 
 	for _, name := range []string{"dsci.yaml", "monitoring.yaml", "lgtm.yaml"} {
 		path := filepath.Join("prerequisites", "inference", name)

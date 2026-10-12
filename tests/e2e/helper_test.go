@@ -101,11 +101,16 @@ const (
 	odhOperatorWebhookService = "opendatahub-operator-webhook-service"
 	// lokiStorageType mirrors spec.monitoring.usageLogs.storage.type there.
 	lokiStorageType = "s3"
-	// lokiS3SecretName mirrors spec.monitoring.usageLogs.storage.secretName there.
-	lokiS3SecretName = "loki-s3-secret"
+	// lokiS3SecretName mirrors spec.monitoring.usageLogs.storage.secretName there. The test-
+	// prefix is load-bearing: the suite overwrites this Secret and then deletes it, so the name
+	// must not be one a real S3 backend would use.
+	lokiS3SecretName = "test-loki-s3-secret"
 	// lokiCredentialMode mirrors spec.monitoring.usageLogs.storage.credentialMode there.
 	lokiCredentialMode = "static"
-	// lokiStorageClassName mirrors spec.monitoring.usageLogs.storage.storageClassName there.
+	// lokiStorageClassName is the literal spec.monitoring.usageLogs.storage.storageClassName the
+	// inference manifests carry. It is a placeholder, not a requirement: renderManifest
+	// substitutes the cluster's detected default class for it, the same way it substitutes the
+	// redhat-ods-* namespaces. Nothing requires a cluster to have a class by this name.
 	lokiStorageClassName = "gp3-csi"
 
 	// maasConfigCRName is the singleton cluster-scoped MaaS Config the maas-controller bootstraps
@@ -278,7 +283,7 @@ func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	t.Helper()
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		withMetricsConfig(),
+		tc.withMetricsConfig(),
 	)
 }
 
@@ -635,7 +640,7 @@ func withManagementState(state common.ManagementState) jq.TransformFn {
 	return jq.Transform(`.spec.managementState = "%s"`, state)
 }
 
-func withMetricsConfig() jq.TransformFn {
+func (tc *TestContext) withMetricsConfig() jq.TransformFn {
 	return jq.Transform(`.spec.metrics = {
         "storage": {
             "size": "%s",

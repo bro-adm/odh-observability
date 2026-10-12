@@ -26,7 +26,7 @@ spec:
     usageLogs:
       storage:
         type: s3
-        secretName: loki-s3-secret
+        secretName: test-loki-s3-secret
         credentialMode: static
         storageClassName: gp3-csi
     namespace: redhat-ods-monitoring
