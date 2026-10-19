@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
@@ -278,7 +279,6 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployTracingStack,
 		deployOpenTelemetryCollector,
 		deployUsageLogsCollector,
-		deployLokiStack,
 		deployAlerting,
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
@@ -288,6 +288,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 			return ctrl.Result{}, err
 		}
 	}
+
+	// A rejected LokiStack storage configuration must not stall metrics, traces
+	// or anything else, so the error is held until the end of the reconcile
+	// instead of aborting here. deployLokiStack reports it on both LokiStack
+	// conditions and hands back the templates it withheld.
+	var withheldSources []rendertemplate.TemplateSource
+	lokiErr := deployLokiStack(ctx, r.Client, monitoring, cm, &sources, &withheldSources)
 
 	// Perses actions share the pre-resolved API version.
 	if err := deployPerses(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
@@ -320,9 +327,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	// Garbage-collect stale owned resources via API discovery.
-	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
-		log.Error(err, "Garbage collection encountered errors")
-	}
+	r.collectGarbageRetaining(ctx, monitoring, desired, withheldSources, data)
 
 	r.syncPostDeployResources(ctx, monitoring, cm)
 
@@ -344,6 +349,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	cm.AggregateReady()
+
+	// Surface a withheld LokiStack configuration now that every other feature
+	// has been reconciled. Storage Secrets are not watched, so the retry this
+	// triggers is the only way a corrected configuration gets noticed.
+	if lokiErr != nil {
+		return ctrl.Result{}, lokiErr
+	}
 
 	// Stamp the platform version only after reconciliation has applied
 	// desired state without returning an error. Early exits (Removed,
@@ -456,6 +468,52 @@ type resourceKey struct {
 	gvk       schema.GroupVersionKind
 	namespace string
 	name      string
+}
+
+// collectGarbageRetaining garbage-collects stale owned resources, counting the
+// withheld templates as desired on top of what was applied.
+//
+// Withheld resources were deliberately not applied — the LokiStacks held back
+// by a rejected storage configuration — but they are not stale either, so
+// rendering them keeps an already-running stack out of the collector's reach
+// while everything else is still collected as usual.
+func (r *MonitoringReconciler) collectGarbageRetaining(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	applied []unstructured.Unstructured,
+	withheld []rendertemplate.TemplateSource,
+	data map[string]any,
+) {
+	log := logf.FromContext(ctx)
+
+	desired, err := r.desiredForGarbageCollection(ctx, applied, withheld, data)
+	if err != nil {
+		// Only reachable through a template bug, never through user input.
+		// Without these keys the collector cannot tell the withheld resources
+		// from stale ones, and deleting live log storage is worse than carrying
+		// stale resources for one round.
+		log.Error(err, "Skipping garbage collection, cannot render withheld resources")
+		return
+	}
+
+	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
+		log.Error(err, "Garbage collection encountered errors")
+	}
+}
+
+// desiredForGarbageCollection combines the applied resources with the rendered
+// withheld ones into the set garbage collection must preserve.
+func (r *MonitoringReconciler) desiredForGarbageCollection(
+	ctx context.Context,
+	applied []unstructured.Unstructured,
+	withheld []rendertemplate.TemplateSource,
+	data map[string]any,
+) ([]unstructured.Unstructured, error) {
+	retained, err := rendertemplate.Render(ctx, r.Scheme, withheld, data)
+	if err != nil {
+		return nil, fmt.Errorf("rendering withheld templates: %w", err)
+	}
+	return slices.Concat(applied, retained), nil
 }
 
 // collectGarbage deletes owned resources not in the desired set using API discovery.
