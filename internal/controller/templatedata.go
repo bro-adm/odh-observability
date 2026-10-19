@@ -60,6 +60,8 @@ const (
 	defaultStorageSize = "5Gi"
 	defaultRetention   = "90d"
 
+	defaultLokiStorageClassName = "gp3-csi"
+
 	defaultTracesSampleRatio = "0.1"
 	defaultTracesBackend     = "pv"
 	defaultTracesRetention   = "2160h"
@@ -202,41 +204,18 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		}
 	}
 
-	// LokiStack configuration
-	lokiStackName := lokiStackResourceName
-	templateData["LokiStackName"] = lokiStackName
-	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
-	// application tenant is the pinned tenant for inference logs.
-	templateData["LokiTenant"] = "application"
 	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
-	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
-	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
-	var lokiStorage *v1alpha1.LokiStorageConfig
-	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
-		lokiStorage = logs.Storage
-	} else if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		lokiStorage = usageLogs.Storage
-	}
 
-	if lokiStorage != nil {
-		templateData["LokiStorageCredentialMode"] = lokiStorage.CredentialMode
-		templateData["LokiStorageSecretName"] = lokiStorage.SecretName
-		templateData["LokiStorageType"] = lokiStorage.Type
+	addLokiTemplateData(monitoring, monitoringNamespace, templateData)
 
-		storageClassName := lokiStorage.StorageClassName
-		if storageClassName == "" {
-			storageClassName = "gp3-csi"
+	// Usage logs forwarding is independent of the Loki stacks: the remote
+	// exporters, the credential they authenticate with, and the attributes
+	// stamped on their records are resolved whether or not a cluster-local
+	// store is configured.
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil {
+		if err := addUsageLogsExportersData(usageLogs, templateData); err != nil {
+			return nil, err
 		}
-		templateData["LokiStorageClassName"] = storageClassName
-	} else {
-		templateData["LokiStorageCredentialMode"] = ""
-		templateData["LokiStorageSecretName"] = ""
-		templateData["LokiStorageType"] = ""
-		templateData["LokiStorageClassName"] = ""
-	}
-
-	if err := addUsageLogsData(monitoring, lokiStackName, monitoringNamespace, templateData); err != nil {
-		return nil, err
 	}
 
 	// Cluster log forwarding configuration
@@ -285,6 +264,72 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	return templateData, nil
+}
+
+// addLokiTemplateData fills in the names, query endpoints, and storage settings
+// for both LokiStacks: the usage logs stack backed by usageLogs.Storage and the
+// log forwarding stack backed by logs.Storage. They are separate CRs, so
+// neither feature's storage configuration leaks into the other's stack.
+func addLokiTemplateData(monitoring *v1alpha1.Monitoring, monitoringNamespace string, templateData map[string]any) {
+	templateData["UsageLogsLokiStackName"] = usageLogsLokiStackResourceName
+	templateData["LokiStackName"] = LokiStackResourceName
+	// Both LokiStacks are configured in OpenShift logging mode. Their
+	// application tenant is the pinned tenant for inference logs.
+	templateData["LokiTenant"] = "application"
+	templateData["UsageLogsLokiQueryEndpoint"] = lokiGatewayURL(usageLogsLokiStackResourceName, monitoringNamespace)
+	templateData["LokiQueryEndpoint"] = lokiGatewayURL(LokiStackResourceName, monitoringNamespace)
+
+	var usageLogsLokiStorage, lokiStorage *v1alpha1.LokiStorageConfig
+	// LokiStackSize feeds the log forwarding stack's template. usageLogs.Size
+	// governed the single shared stack and remains the size knob; unset means
+	// the shipped default.
+	lokiStackSize := defaultLokiStackSize
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil {
+		usageLogsLokiStorage = usageLogs.Storage
+		if usageLogs.Size != "" {
+			lokiStackSize = usageLogs.Size
+		}
+	}
+	if logs := monitoring.Spec.Logs; logs != nil {
+		lokiStorage = logs.Storage
+	}
+	addLokiStorageData("UsageLogsLoki", usageLogsLokiStorage, templateData)
+	addLokiStorageData("Loki", lokiStorage, templateData)
+	templateData["LokiStackSize"] = lokiStackSize
+
+	// Usage logs collector configuration (independent of Loki storage resolution)
+	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
+	if usageLogsLokiStorage != nil {
+		templateData["UsageLogs"] = true
+		templateData["UsageLogsEndpoint"] = lokiGatewayURL(usageLogsLokiStackResourceName, monitoringNamespace) + "/otlp"
+	} else {
+		templateData["UsageLogs"] = false
+		templateData["UsageLogsEndpoint"] = ""
+	}
+}
+
+// lokiGatewayURL returns the in-cluster gateway URL for the application tenant
+// of the named LokiStack.
+func lokiGatewayURL(lokiStackName, namespace string) string {
+	return fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, namespace)
+}
+
+// addLokiStorageData writes the <prefix>Storage* keys for one LokiStack.
+// Templates render with missingkey=error, so the keys are always set, blank
+// when that stack has no storage configured.
+func addLokiStorageData(prefix string, storage *v1alpha1.LokiStorageConfig, templateData map[string]any) {
+	if storage == nil {
+		templateData[prefix+"StorageCredentialMode"] = ""
+		templateData[prefix+"StorageSecretName"] = ""
+		templateData[prefix+"StorageType"] = ""
+		templateData[prefix+"StorageClassName"] = ""
+		return
+	}
+
+	templateData[prefix+"StorageCredentialMode"] = storage.CredentialMode
+	templateData[prefix+"StorageSecretName"] = storage.SecretName
+	templateData[prefix+"StorageType"] = storage.Type
+	templateData[prefix+"StorageClassName"] = getStringValueOrDefault(storage.StorageClassName, defaultLokiStorageClassName)
 }
 
 // addKorrel8rConfigChecksum derives the Pod-template value that restarts
@@ -544,50 +589,6 @@ func addExportersData(metrics *v1alpha1.Metrics, templateData map[string]any) er
 	templateData["MetricsExporterNames"] = exporterNames
 
 	return nil
-}
-
-// addUsageLogsData resolves everything the usage-log collector renders from: the LokiStack
-// size that governs the shared stack, whether the cluster-local write is configured and the
-// endpoint it uses, and the remote exporters alongside it. Kept out of buildTemplateData so
-// that function stays under the cyclomatic complexity limit.
-func addUsageLogsData(monitoring *v1alpha1.Monitoring, lokiStackName, monitoringNamespace string, templateData map[string]any) error {
-	usageLogs := monitoring.Spec.UsageLogs
-
-	// LokiStack size. One stack currently serves both cluster log forwarding and usage
-	// logs, so the usage-log size governs it; when the two stacks split this follows
-	// the usage stack. Unset means the shipped default.
-	lokiStackSize := defaultLokiStackSize
-	if usageLogs != nil && usageLogs.Size != "" {
-		lokiStackSize = usageLogs.Size
-	}
-	templateData["LokiStackSize"] = lokiStackSize
-
-	// Independent of the Loki storage resolution above: the collector is named whether or
-	// not it is configured, because the reconciler looks it up either way.
-	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
-
-	if usageLogs == nil {
-		templateData["UsageLogs"] = false
-		templateData["UsageLogsEndpoint"] = ""
-		return nil
-	}
-
-	// The two writes are configured independently: storage drives the cluster-local
-	// pipeline, exporters drive the forwarding one, and a cluster may have either or
-	// both. So UsageLogs says only whether a local store exists, and the exporters are
-	// resolved below either way — a cluster that only forwards still has to render them.
-	if usageLogs.Storage != nil {
-		templateData["UsageLogs"] = true
-		templateData["UsageLogsEndpoint"] = fmt.Sprintf(
-			"https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp",
-			lokiStackName, monitoringNamespace,
-		)
-	} else {
-		templateData["UsageLogs"] = false
-		templateData["UsageLogsEndpoint"] = ""
-	}
-
-	return addUsageLogsExportersData(usageLogs, templateData)
 }
 
 // addUsageLogsExportersData validates the usage-log exporters and the resource
