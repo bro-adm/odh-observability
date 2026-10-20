@@ -82,8 +82,21 @@ const (
 	// and as a workload role on Korrel8r and the querier, neither of which is a
 	// subsystem boundary.
 	componentLabel = "platform.opendatahub.io/component"
-	componentLoki  = "loki"
+
+	// The two LokiStacks are two components, not one. They have separate
+	// storage, separate conditions and separate endpoints, and withholding one
+	// from collection on the other's account would stop the user's deletion of
+	// it from taking effect for as long as the other kept failing.
+	componentLokiUsageLogs = "loki-usage-logs"
+	componentLokiLogs      = "loki-logs"
 )
+
+// lokiComponents is every component value a LokiStack-owned resource can
+// carry, in the order the reconcile deploys them. The reconcile loop walks it
+// to decide which stacks the storage gate left standing, and
+// shouldCollectOwnedResource reads it for the by-kind fallback that covers
+// resources predating componentLabel.
+var lokiComponents = []string{componentLokiUsageLogs, componentLokiLogs}
 
 func operatorVersion() string {
 	return os.Getenv("OPERATOR_VERSION")
@@ -279,7 +292,9 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{}, nil
 	}
 
-	// Run non-Perses action functions to collect template sources.
+	// Run the action functions to collect template sources. The three Perses
+	// ones are closures because they also take the pre-resolved API version;
+	// they are otherwise ordinary actions and belong in the same list.
 	var sources []rendertemplate.TemplateSource
 	for _, action := range []func(context.Context, client.Client, *v1alpha1.Monitoring, *conditions.ConditionsManager, *[]rendertemplate.TemplateSource) error{
 		deployWebhookInfrastructure,
@@ -292,32 +307,47 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
 		deployKorrel8r,
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPerses(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPersesTempoIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPersesPrometheusIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	// A rejected LokiStack storage configuration must not stall metrics, traces
-	// or anything else, so the error is held until the end of the reconcile
-	// instead of aborting here. deployLokiStack reports it on both LokiStack
-	// conditions and renders neither stack, which would read as "deleted by the
-	// user" to garbage collection — hence the shield below.
-	withheldComponents := map[string]struct{}{}
-	lokiErr := deployLokiStack(ctx, r.Client, monitoring, cm, &sources)
-	if lokiErr != nil {
-		withheldComponents[componentLoki] = struct{}{}
-	}
+	// The storage gate runs ahead of every claimant it reports on. Its error
+	// is held rather than returned: a rejected storage configuration is a
+	// verdict on the spec, not a failure of the reconcile, so Deploy, the
+	// shielded sweep, the endpoints and the Ready aggregation all still run.
+	withheldComponents, storageErr := validateStorageIsolation(ctx, r.Client, monitoring, cm)
 
-	// Perses actions share the pre-resolved API version.
-	if err := deployPerses(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := deployPersesTempoIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := deployPersesPrometheusIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return ctrl.Result{}, err
+	// Each stack runs unless the gate withheld its component. Past that check
+	// they are ordinary actions whose errors abort the round, which is what
+	// keeps them free of any shield of their own.
+	for _, component := range lokiComponents {
+		if _, withheld := withheldComponents[component]; withheld {
+			continue
+		}
+		var err error
+		switch component {
+		case componentLokiUsageLogs:
+			err = deployUsageLogsLokiStack(ctx, r.Client, monitoring, cm, &sources)
+		case componentLokiLogs:
+			err = deployRHOAILogsLokiStack(ctx, r.Client, monitoring, cm, &sources)
+		}
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Render all template sources.
@@ -350,11 +380,12 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	cm.AggregateReady()
 
-	// Surface a withheld LokiStack configuration now that every other feature
-	// has been reconciled. Storage Secrets are not watched, so the retry this
-	// triggers is the only way a corrected configuration gets noticed.
-	if lokiErr != nil {
-		return ctrl.Result{}, lokiErr
+	// Surface the withheld storage configuration now that every other feature
+	// has been reconciled and the shielded sweep has run. Returning it at all
+	// is what puts the round into backoff rather than reporting success on a
+	// spec the operator refused to render.
+	if storageErr != nil {
+		return ctrl.Result{}, storageErr
 	}
 
 	// Stamp the platform version only after reconciliation has applied
@@ -440,11 +471,13 @@ func isOpenTelemetryOperatorNetworkPolicyEvent(obj client.Object) bool {
 // and reports whether a short requeue is needed to pick up one that is not
 // ready yet.
 //
-// An endpoint is published only once its stack reports ready. deployLokiStack
-// already observed that readiness and recorded it on the condition, so this
-// reads the condition back instead of re-fetching either CR. LokiStack is not
-// watched (only core kinds are), hence the requeue: nothing else would bring
-// the reconciler back when a stack finishes coming up.
+// An endpoint is published only once its stack reports ready. The stack's own
+// deploy already observed that readiness and recorded it on the condition, so
+// this reads the condition back instead of re-fetching either CR. The two
+// stacks are evaluated separately here for the same reason they deploy
+// separately: one being unobservable says nothing about the other. LokiStack
+// is not watched (only core kinds are), hence the requeue: nothing else would
+// bring the reconciler back when a stack finishes coming up.
 //
 // Clearing the endpoint of a stack that is confirmed not ready is deliberate.
 // These fields are what other components dial, and a stale address outlives the
@@ -471,10 +504,12 @@ func publishLokiEndpoints(monitoring *v1alpha1.Monitoring, data map[string]any) 
 			// Could not observe: hold the last known endpoint. On a first
 			// reconcile that holds "", which is what it already was.
 			//
-			// Unknown currently always accompanies a held lokiErr, which
-			// returns before the requeue check and gets controller-runtime
-			// backoff instead. Set it anyway so an Unknown that arrives
-			// without an error still gets polled.
+			// Every Unknown that reaches here today arrives with an error
+			// behind it — the stack action returned one and aborted before
+			// this ran, or the storage gate held one and returns below — and
+			// both get controller-runtime backoff rather than this requeue.
+			// Set it anyway so an Unknown that arrives without an error is
+			// still polled instead of waiting for the periodic round.
 			requeueNeeded = true
 		default:
 			*endpoint = ""
@@ -659,9 +694,19 @@ func shouldCollectOwnedResource(
 	// recreated without losing logs, and its GVK belongs to no other component,
 	// so shield it by kind as well. The sibling NetworkPolicies are stateless
 	// and come back with the next clean apply, so they get no such fallback.
-	if _, lokiWithheld := withheldComponents[componentLoki]; lokiWithheld &&
-		obj.GroupVersionKind() == controllergvk.LokiStack {
-		return false
+	//
+	// Any Loki component being withheld is the right trigger, coarse as it is.
+	// An unlabelled stack cannot say which component it belongs to, and its
+	// name does not settle it either: data-science-lokistack was the usage
+	// logs stack before this split and is the log forwarding stack after it.
+	// Shielding one stack for a round longer than strictly necessary costs a
+	// delayed deletion; guessing wrong costs the logs.
+	if obj.GroupVersionKind() == controllergvk.LokiStack {
+		for _, component := range lokiComponents {
+			if _, lokiWithheld := withheldComponents[component]; lokiWithheld {
+				return false
+			}
+		}
 	}
 
 	k := resourceKey{
