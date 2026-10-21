@@ -331,23 +331,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// shielded sweep, the endpoints and the Ready aggregation all still run.
 	withheldComponents, storageErr := validateStorageIsolation(ctx, r.Client, monitoring, cm)
 
-	// Each stack runs unless the gate withheld its component. Past that check
-	// they are ordinary actions whose errors abort the round, which is what
-	// keeps them free of any shield of their own.
-	for _, component := range lokiComponents {
-		if _, withheld := withheldComponents[component]; withheld {
-			continue
-		}
-		var err error
-		switch component {
-		case componentLokiUsageLogs:
-			err = deployUsageLogsLokiStack(ctx, r.Client, monitoring, cm, &sources)
-		case componentLokiLogs:
-			err = deployRHOAILogsLokiStack(ctx, r.Client, monitoring, cm, &sources)
-		}
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	if err := deployLokiStacks(ctx, r.Client, monitoring, cm, &sources, withheldComponents); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Render all template sources.
