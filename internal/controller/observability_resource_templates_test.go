@@ -611,6 +611,7 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		"LokiStorageType":                    "s3",
 		"LokiStorageCredentialMode":          "static",
 		"LokiStorageClassName":               "logs-sc",
+		"LokiStackSize":                      "1x.extra-small",
 		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
 		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
 		"UsageLogsLokiStorageType":           "s3",
@@ -618,9 +619,16 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
 		"Korrel8rName":                       Korrel8rServiceName,
 		// The usage logs gateway policy names the collector as its only peer.
-		"UsageLogsCollectorName":               "data-science-usage-logs",
-		"UsageLogs":                            true,
-		"UsageLogsEndpoint":                    "https://usage-logs.example.com/otlp",
+		"UsageLogsCollectorName": "data-science-usage-logs",
+		"UsageLogs":              true,
+		"UsageLogsEndpoint":      "https://usage-logs.example.com/otlp",
+		// The remote-exporter keys render empty: the component label is the
+		// contract here, with or without a forwarding configuration.
+		"UsageLogsCredentialSecret":            "",
+		"UsageLogsExporters":                   map[string]string{},
+		"UsageLogsExporterNames":               []string{},
+		"UsageLogsAttributes":                  map[string]string{},
+		"UsageLogsAttributeNames":              []string{},
 		"CollectorReplicas":                    1,
 		"CollectorCPURequest":                  "100m",
 		"CollectorCPULimit":                    "500m",

@@ -4151,13 +4151,15 @@ func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
 		t.Fatalf("UsageLogsCollectorAvailable: want True/ForwardingOnly, got %v", c)
 	}
 
-	var lokiSources, withheldSources []rendertemplate.TemplateSource
-	if err := deployLokiStack(context.Background(), cli, m,
-		conditions.NewConditionsManager(m, m.Generation), &lokiSources, &withheldSources); err != nil {
-		t.Fatalf("deployLokiStack error: %v", err)
+	var lokiSources []rendertemplate.TemplateSource
+	if err := deployUsageLogsLokiStack(context.Background(), cli, m,
+		conditions.NewConditionsManager(m, m.Generation), &lokiSources); err != nil {
+		t.Fatalf("deployUsageLogsLokiStack error: %v", err)
 	}
-	if len(lokiSources) != 0 {
-		t.Errorf("forwarding alone must not deploy a LokiStack, got %d sources", len(lokiSources))
+	for _, source := range lokiSources {
+		if source.Path == UsageLogsLokiStackTemplate {
+			t.Errorf("forwarding alone must not deploy a LokiStack, got %s", source.Path)
+		}
 	}
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")
